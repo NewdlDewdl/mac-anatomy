@@ -19,7 +19,7 @@ jobs:
         os: [macos-14, macos-15, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Show macOS and bash versions
         run: |
