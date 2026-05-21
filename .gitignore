@@ -1,0 +1,38 @@
+# OS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+
+# Local report artifacts
+mac-anatomy-*.html
+*.html.tmp
+/tmp-report/
+
+# Test artifacts
+/tests/tmp/
+/.bats-cache/
+
+# Logs
+*.log
+
+# Local config — never commit personal install state
+.envrc
+.env
+.env.local
+
+# Build / dist (none expected but defensive)
+/dist/
+/build/

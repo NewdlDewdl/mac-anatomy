@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: bats + shellcheck on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show macOS and bash versions
+        run: |
+          sw_vers
+          /bin/bash --version | head -1
+          uname -m
+
+      - name: Install bats-core and shellcheck
+        run: |
+          brew update --quiet
+          brew install bats-core shellcheck
+
+      - name: Lint with shellcheck (fail on errors, warnings allowed)
+        run: |
+          shellcheck --severity=error bin/mac-anatomy
+          shellcheck bin/mac-anatomy || true
+
+      - name: Print version
+        run: ./bin/mac-anatomy --version
+
+      - name: Print help
+        run: ./bin/mac-anatomy --help
+
+      - name: Overview smoke test
+        run: ./bin/mac-anatomy --no-color overview
+
+      - name: Doctor (allow non-zero; runners may have warnings)
+        run: ./bin/mac-anatomy --no-color doctor || true
+
+      - name: Run bats suite
+        run: bats --tap tests/

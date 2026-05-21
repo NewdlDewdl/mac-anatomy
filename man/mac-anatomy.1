@@ -1,0 +1,161 @@
+.TH MAC\-ANATOMY 1 "2026-05-21" "mac-anatomy 0.1.0" "User Commands"
+.SH NAME
+mac\-anatomy \- map and audit the macOS root filesystem
+.SH SYNOPSIS
+.B mac\-anatomy
+[\fIGLOBAL\-FLAGS\fR]
+[\fISUBCOMMAND\fR]
+[\fIARGS\fR]
+.SH DESCRIPTION
+Modern macOS (Big Sur and later) splits the boot volume into a sealed,
+read-only System volume (the SSV) and a writable Data volume that is
+firmlinked into the same namespace at
+.IR /Users ,
+.IR /Library ,
+.IR /Applications ,
+and so on. The result is a unified-looking root that is actually two
+volumes glued together by per-path kernel redirections.
+.PP
+.B mac\-anatomy
+maps that layout, audits it for surprising state, and explains
+in-place why things are where they are. It is a read-only inspection
+tool \- it never modifies the filesystem.
+.SH SUBCOMMANDS
+.TP
+.B overview
+Quick summary: macOS version, boot volume mount status, SIP, root layout.
+This is the default when no subcommand is given.
+.TP
+.B volumes
+Parsed APFS container and volume structure via \fBdiskutil apfs list\fR.
+Supports \fB\-\-json\fR.
+.TP
+.B firmlinks
+List \fI/usr/share/firmlinks\fR with explanations of how each entry maps
+a synthetic-root path to its actual location on the Data volume.
+Supports \fB\-\-json\fR.
+.TP
+.B symlinks
+Root-level symlinks (\fI/etc\fR, \fI/var\fR, \fI/tmp\fR, ...) resolved
+with annotations explaining their NeXTSTEP/BSD origins.
+Supports \fB\-\-json\fR.
+.TP
+.B sip
+Current System Integrity Protection status plus a description of what
+it protects (filesystem, NVRAM, kexts, debugging, task inspection).
+.TP
+.B setuid
+Setuid and setgid binaries in
+.IR /usr/bin ,
+.IR /usr/sbin ,
+.IR /bin ,
+.IR /sbin ,
+.IR /usr/libexec .
+Surprises here are red flags. Supports \fB\-\-json\fR.
+.TP
+.BR world\-writable " | " ww
+Find world-writable files in critical system directories (system
+binaries, \fI/etc\fR, system frameworks, kernel extensions, launchd
+agents and daemons). On a healthy system this returns zero hits.
+Supports \fB\-\-json\fR.
+.TP
+.BR "tree " [ \fIdepth\fR ]
+ASCII tree of the root volume to the given depth (default 2, max 6).
+Uses
+.B tree
+from Homebrew if available; otherwise falls back to a find-based
+indented listing.
+.TP
+.B doctor
+Run a sequence of health checks against the root volume and print a
+human-readable verdict. Exit codes:
+.RS
+.IP 0 4
+healthy
+.IP 1 4
+warnings present
+.IP 2 4
+critical issue (SSV not sealed)
+.RE
+Supports \fB\-\-json\fR.
+.TP
+.BR "report " [ \fIpath\fR ]
+Generate a single-file HTML report combining every section. Default
+output path is \fI/tmp/mac-anatomy-\fIyyyymmdd\fI-\fIhhmmss\fI.html\fR.
+.SH "GLOBAL FLAGS"
+.TP
+.B \-\-json
+Machine-readable output for subcommands that support it. Output is pure
+JSON with no headers, banners, or ANSI escapes.
+.TP
+.B \-\-no\-color
+Disable ANSI color output even when stdout is a TTY.
+.TP
+.BR \-\-quiet ", " \-q
+Suppress section headers in human-readable output.
+.TP
+.BR \-\-verbose ", " \-v
+Extra detail (reserved for future use).
+.TP
+.B \-\-open
+With
+.B report
+only: open the generated HTML in the default browser via
+.BR open (1).
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.BR \-\-help ", " \-h
+Print usage and exit.
+.SH EXAMPLES
+.PP
+Default overview:
+.PP
+.RS
+.B mac\-anatomy
+.RE
+.PP
+Generate a full HTML report and open it:
+.PP
+.RS
+.B mac\-anatomy report \-\-open
+.RE
+.PP
+Use the doctor exit code in a shell script:
+.PP
+.RS
+\fBmac\-anatomy doctor || echo "investigate"\fR
+.RE
+.PP
+Get machine-readable firmlinks for processing with jq:
+.PP
+.RS
+\fBmac\-anatomy firmlinks \-\-json | jq '.[] | .path'\fR
+.RE
+.SH "EXIT STATUS"
+Most subcommands exit 0 on success and non-zero on usage errors. The
+.B doctor
+subcommand uses a graded exit code as described above.
+.SH FILES
+.TP
+.I /usr/share/firmlinks
+Tab-separated list of synthetic-root → Data volume bindings consumed at
+boot to set up firmlinks.
+.SH "SEE ALSO"
+.BR mac-doctor (1),
+.BR finder-doctor (1),
+.BR disk-doctor (1),
+.BR startup-doctor (1),
+.BR monitor-info (1),
+.BR diskutil (8),
+.BR csrutil (8),
+.BR mount (8),
+.BR find (1),
+.BR readlink (1)
+.SH AUTHOR
+Rohin Agrawal <rohin.agrawal@gmail.com>
+.SH "REPORTING BUGS"
+https://github.com/NewdlDewdl/mac-anatomy/issues
+.SH COPYRIGHT
+Copyright \(co 2026 Rohin Agrawal. MIT licensed.

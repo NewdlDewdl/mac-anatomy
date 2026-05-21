@@ -1,0 +1,834 @@
+#!/usr/bin/env bash
+# mac-anatomy — map and audit the macOS root filesystem.
+#
+# Modern macOS (Big Sur+) split the boot volume into two:
+#
+#   • A sealed, read-only System volume — the SSV (Signed System Volume).
+#     Cryptographically verified at every boot. Even root cannot write to
+#     it without `csrutil disable` from Recovery, unsealing the volume,
+#     and rebooting. Try `git init /` on macOS 11+ and you'll get
+#     "Read-only file system" no matter what your user is. (That's the
+#     story behind this tool existing in the first place.)
+#
+#   • A writable Data volume firmlinked into the same namespace at
+#     /Users, /Library, /Applications, /Volumes, /private, etc. When
+#     you `ls /`, you see a unified root, but the bytes live across
+#     two volumes that mount-as-one via per-path firmlinks declared in
+#     /usr/share/firmlinks.
+#
+# Layer in /etc → /private/etc, /var → /private/var, /tmp → /private/tmp
+# symlinks left over from NeXTSTEP/BSD, plus SIP-protected paths that
+# even sudo can't touch, and the macOS root is harder to reason about
+# than it looks. Most people don't realize their / is two volumes glued
+# together with kernel-level path redirection.
+#
+# This tool maps that layout, audits it for surprising state, and explains
+# (in-place, with annotations) why things are where they are.
+#
+# Subcommands:
+#   (default)         quick overview of the root volume + SIP + layout
+#   volumes           APFS container + volume structure (diskutil)
+#   firmlinks         list /usr/share/firmlinks with target explanations
+#   symlinks          root-level symlinks resolved with legacy annotations
+#   sip               SIP status + what it protects + how to disable
+#   setuid            setuid/setgid binaries in /usr/bin, /usr/sbin, /bin,
+#                     /sbin, /usr/libexec — surprises are red flags
+#   world-writable    security audit for world-writable files in system dirs
+#   tree [depth]      ASCII tree of root (default depth 2)
+#   doctor            health check (SSV sealed, SIP on, no surprises)
+#   report [path]     generate single-file HTML report, all sections
+#
+# Flags:
+#   --json            machine-readable output (where supported)
+#   --no-color        disable ANSI color
+#   --quiet | -q      suppress section headers
+#   --verbose | -v    extra detail
+#   --open            (with `report`) open generated HTML in default browser
+#   --version         print version
+#   --help | -h       print this help
+#
+# Companion to mac-doctor, finder-doctor, disk-doctor, startup-doctor,
+# monitor-info — same family, different concern: those FIX things;
+# this one EXPLAINS them.
+#
+# Repository: https://github.com/NewdlDewdl/mac-anatomy
+# License:    MIT
+# Author:     Rohin Agrawal <rohin.agrawal@gmail.com>
+
+set -uo pipefail
+
+readonly VERSION="0.1.0"
+readonly REPO_URL="https://github.com/NewdlDewdl/mac-anatomy"
+
+# Targets stock macOS bash (3.2.57 at /bin/bash) — no `declare -A`, no
+# `mapfile`, no `${var^^}`, etc. Tested on bash 3.2 and 5.x. The other
+# doctors in this family (mac-doctor, disk-doctor, startup-doctor) also
+# target 3.2 for the same reason: don't make users `brew install bash`
+# just to run a single CLI tool.
+if [[ "${BASH_VERSINFO[0]:-0}" -lt 3 ]]; then
+  echo "mac-anatomy requires bash 3+ (yours: ${BASH_VERSION:-unknown})." >&2
+  exit 1
+fi
+
+# ─── runtime options ────────────────────────────────────────────────────
+JSON=0
+QUIET=0
+VERBOSE=0
+NO_COLOR=0
+OPEN_REPORT=0
+
+# ─── colors (set in setup_colors, called after flag parse) ──────────────
+C_RED=""; C_YELLOW=""; C_GREEN=""; C_BLUE=""; C_CYAN=""
+C_DIM=""; C_BOLD=""; C_RESET=""
+
+setup_colors() {
+  if [[ -t 1 && $NO_COLOR -eq 0 ]]; then
+    C_RED=$'\e[31m';    C_YELLOW=$'\e[33m'; C_GREEN=$'\e[32m'
+    C_BLUE=$'\e[34m';   C_CYAN=$'\e[36m';   C_DIM=$'\e[2m'
+    C_BOLD=$'\e[1m';    C_RESET=$'\e[0m'
+  else
+    C_RED=""; C_YELLOW=""; C_GREEN=""; C_BLUE=""; C_CYAN=""
+    C_DIM=""; C_BOLD=""; C_RESET=""
+  fi
+}
+
+# ─── helpers ────────────────────────────────────────────────────────────
+err()  { printf '%smac-anatomy:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+note() { (( QUIET == 0 )) && printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET" >&2 || true; }
+
+header() {
+  (( QUIET )) && return 0
+  printf '\n%s%s── %s ──%s\n' "$C_BOLD" "$C_CYAN" "$1" "$C_RESET"
+}
+
+require_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "mac-anatomy is macOS-only (detected: $(uname -s))"
+}
+
+html_escape() {
+  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+# Run a command and capture stdout+stderr, returning success even on error
+# (subcommands shouldn't crash the report on a single failure).
+safe_capture() {
+  "$@" 2>&1 || true
+}
+
+# ─── subcommand: overview (default) ─────────────────────────────────────
+cmd_overview() {
+  require_macos
+
+  header "macOS"
+  sw_vers | sed 's/^/  /'
+  echo "  Architecture:   $(uname -m)"
+  echo "  Host:           $(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+  echo "  Kernel:         $(uname -r)"
+
+  if (( VERBOSE )); then
+    local ram_gb cpus uptime_str loadavg
+    ram_gb=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.1f GB", $1/1073741824}')
+    cpus=$(sysctl -n hw.ncpu 2>/dev/null)
+    # uptime stems "1 user" (singular) and "N users" (plural). Strip at
+    # the first ", <digit>" which catches both.
+    uptime_str=$(uptime | sed 's/^.*up //; s/, *[0-9].*//')
+    loadavg=$(uptime | sed 's/.*load averages: //; s/.*load average: //')
+    echo "  RAM:            $ram_gb"
+    echo "  CPUs:           $cpus"
+    echo "  Uptime:         $uptime_str"
+    echo "  Load:           $loadavg"
+  fi
+
+  header "Boot volume"
+  local mount_line
+  mount_line=$(mount | awk '$3 == "/" {print}')
+  echo "  $mount_line"
+  if [[ "$mount_line" == *sealed* ]]; then
+    printf '  %s✓%s System volume is sealed (Signed System Volume, verified at boot)\n' "$C_GREEN" "$C_RESET"
+  elif [[ -n "$mount_line" ]]; then
+    printf '  %s⚠%s System volume is NOT sealed — SIP may be disabled\n' "$C_YELLOW" "$C_RESET"
+  fi
+
+  header "Disk space"
+  df -h / | sed 's/^/  /'
+
+  header "SIP"
+  csrutil status 2>&1 | sed 's/^/  /'
+
+  header "Root layout summary"
+  local n_dirs n_links n_files
+  n_dirs=$(find / -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+  n_links=$(find / -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
+  n_files=$(find / -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+  printf '  Directories:   %s\n' "$n_dirs"
+  printf '  Symlinks:      %s\n' "$n_links"
+  printf '  Files:         %s\n' "$n_files"
+
+  if [[ -r /usr/share/firmlinks ]]; then
+    local n_firmlinks
+    n_firmlinks=$(grep -cv '^$' /usr/share/firmlinks)
+    printf '  Firmlinks:     %s (from /usr/share/firmlinks)\n' "$n_firmlinks"
+  fi
+
+  header "Next"
+  echo "  mac-anatomy volumes         # APFS container + volume structure"
+  echo "  mac-anatomy firmlinks       # what's actually on the Data volume"
+  echo "  mac-anatomy symlinks        # root-level symlinks + legacy paths"
+  echo "  mac-anatomy doctor          # health check"
+  echo "  mac-anatomy report --open   # full HTML report in browser"
+  echo
+}
+
+# ─── subcommand: volumes ────────────────────────────────────────────────
+cmd_volumes() {
+  require_macos
+
+  if (( JSON )); then
+    diskutil apfs list -plist 2>/dev/null | plutil -convert json -o - - 2>/dev/null \
+      || die "diskutil apfs list -plist failed"
+    return
+  fi
+
+  header "APFS containers + volumes (diskutil apfs list)"
+  diskutil apfs list 2>&1 | sed 's/^/  /'
+  echo
+
+  header "Quick reference"
+  cat <<'EOF'
+  Roles on a typical Apple Silicon Mac:
+    System    sealed read-only SSV — the OS itself
+    Data      writable user-data volume — firmlinked into /
+    VM        backing store for /private/var/vm (swap)
+    Preboot   per-volume-group boot data (recovery, NVRAM seed)
+    Recovery  recoveryOS image used at Cmd-R / power-hold boot
+    Update    used during macOS updates
+
+  All within one APFS container that shares free space across volumes.
+EOF
+  echo
+}
+
+# ─── subcommand: firmlinks ──────────────────────────────────────────────
+cmd_firmlinks() {
+  require_macos
+
+  if [[ ! -r /usr/share/firmlinks ]]; then
+    die "/usr/share/firmlinks not readable (unexpected on macOS 11+)"
+  fi
+
+  if (( JSON )); then
+    printf '['
+    local first=1
+    while IFS=$'\t' read -r src dst; do
+      [[ -z "$src" ]] && continue
+      (( first )) || printf ','
+      first=0
+      printf '{"path":"%s","data_target":"/System/Volumes/Data/%s"}' "$src" "$dst"
+    done < /usr/share/firmlinks
+    printf ']\n'
+    return
+  fi
+
+  header "Firmlinks: synthetic root → Data volume"
+  printf '  %s%-32s%s → %s/System/Volumes/Data/<...>%s\n\n' \
+    "$C_DIM" "synthetic path" "$C_RESET" "$C_DIM" "$C_RESET"
+  while IFS=$'\t' read -r src dst; do
+    [[ -z "$src" ]] && continue
+    printf '  %s%-32s%s → /System/Volumes/Data/%s\n' \
+      "$C_BOLD" "$src" "$C_RESET" "$dst"
+  done < /usr/share/firmlinks
+  echo
+
+  cat <<'EOF'
+  How firmlinks work:
+    The Signed System Volume mounts read-only at /. The user-data volume
+    mounts at /System/Volumes/Data. A firmlink is a per-path "this name
+    on the SSV is actually this directory on Data" mapping. When you
+    read /Applications, the kernel transparently redirects to
+    /System/Volumes/Data/Applications. This is why /Applications stays
+    writable despite / itself being sealed.
+
+    Unlike symlinks, firmlinks don't show up in `ls -l` and don't appear
+    in path resolution traces — they're a kernel-level bind, set once at
+    boot from /usr/share/firmlinks.
+EOF
+  echo
+}
+
+# Per-symlink annotations. Plain case-statement (bash 3.2 has no `-A`).
+_symlink_note() {
+  case "$1" in
+    etc)              echo "legacy NeXTSTEP/BSD location; real config in /private/etc" ;;
+    tmp)              echo "legacy; real scratch in /private/tmp (cleared on reboot via launchd)" ;;
+    var)              echo "legacy; real spool/state/log in /private/var" ;;
+    home)             echo "auto_home automounter target; historically used for NFS-mounted homes" ;;
+    .VolumeIcon.icns) echo "icon shown for the volume in Finder; lives on Data" ;;
+    *)                echo "" ;;
+  esac
+}
+
+# ─── subcommand: symlinks ───────────────────────────────────────────────
+cmd_symlinks() {
+  require_macos
+
+  if (( JSON )); then
+    printf '['
+    local first=1
+    while IFS= read -r link; do
+      local name target
+      name=${link#/}
+      target=$(readlink "$link" 2>/dev/null)
+      (( first )) || printf ','
+      first=0
+      printf '{"name":"%s","target":"%s"}' "$name" "$target"
+    done < <(find / -maxdepth 1 -type l 2>/dev/null | sort)
+    printf ']\n'
+    return
+  fi
+
+  header "Root-level symlinks"
+  while IFS= read -r link; do
+    local name target note
+    name=${link#/}
+    target=$(readlink "$link" 2>/dev/null)
+    note=$(_symlink_note "$name")
+    printf '  %s%-22s%s → %s\n' "$C_BOLD" "$name" "$C_RESET" "$target"
+    [[ -n "$note" ]] && printf '    %s%s%s\n' "$C_DIM" "$note" "$C_RESET"
+  done < <(find / -maxdepth 1 -type l 2>/dev/null | sort)
+  echo
+}
+
+# ─── subcommand: sip ────────────────────────────────────────────────────
+cmd_sip() {
+  require_macos
+
+  header "System Integrity Protection (SIP)"
+  csrutil status 2>&1 | sed 's/^/  /'
+  echo
+
+  cat <<'EOF'
+  SIP protects:
+    • Filesystem  /System, /usr (except /usr/local), /bin, /sbin, parts
+                  of /Applications. Even uid 0 cannot write or delete.
+    • NVRAM       Restricted variables — boot-args is the famous one.
+    • Kexts       Only Apple-signed (or user-approved system-extension-
+                  whitelisted) kernel extensions can load.
+    • Debugging   Apple system processes refuse ptrace/dtrace attach.
+    • Tasks       sudo, fs_usage, opensnoop refuse to inspect Apple procs.
+
+  To disable (rarely warranted, breaks many security guarantees):
+      1. Boot to Recovery: Apple Silicon → power-hold; Intel → Cmd-R.
+      2. Open Terminal in Recovery.
+      3. csrutil disable
+      4. Reboot.
+
+  Disabling SIP on Apple Silicon also turns off Authenticated Root for
+  the SSV, so a snapshot/seal mismatch becomes possible and the boot
+  chain will print a warning. To restore: re-boot to Recovery, run
+  `csrutil enable`, reboot.
+EOF
+  echo
+}
+
+# ─── subcommand: setuid ─────────────────────────────────────────────────
+cmd_setuid() {
+  require_macos
+
+  local -a hits=()
+  while IFS= read -r line; do
+    hits+=("$line")
+  done < <(
+    find /usr/bin /usr/sbin /bin /sbin /usr/libexec \
+         -type f \( -perm -4000 -o -perm -2000 \) -ls 2>/dev/null \
+      | awk '{printf "%-12s %-9s %-9s %8s  %s\n", $3, $5, $6, $7, $11}' \
+      | sort -k5
+  )
+
+  if (( JSON )); then
+    printf '['
+    local first=1
+    if (( ${#hits[@]} > 0 )); then
+      for line in "${hits[@]}"; do
+        (( first )) || printf ','
+        first=0
+        printf '{"raw":"%s"}' "$(printf '%s' "$line" | sed 's/"/\\"/g')"
+      done
+    fi
+    printf ']\n'
+    return
+  fi
+
+  header "Setuid / setgid binaries in system dirs"
+  echo "  Searching /usr/bin /usr/sbin /bin /sbin /usr/libexec ..."
+  echo
+
+  if (( ${#hits[@]} > 0 )); then
+    for line in "${hits[@]}"; do
+      echo "  $line"
+    done
+  fi
+
+  printf '\n  %sTotal: %d%s\n\n' "$C_BOLD" "${#hits[@]}" "$C_RESET"
+  cat <<'EOF'
+  Why setuid exists: lets unprivileged users run a binary with the file
+  owner's privileges. Classic examples: sudo, su, ping (raw socket
+  required), mount, traceroute. Setgid is the same with group privileges.
+
+  Surprises here are red flags. Every entry above should be either an
+  Apple-signed system tool or a deliberately installed package (e.g.,
+  pmset, screencapture, etc.). An unknown setuid root binary is among
+  the strongest indicators of system compromise.
+EOF
+  echo
+}
+
+# ─── subcommand: world-writable ─────────────────────────────────────────
+# Scope is deliberately narrow: system binaries, /etc, and system
+# frameworks/extensions. Searching all of /System or /usr drowns the
+# signal in noise — third-party software (Avid plugins, audio bundles,
+# old installers) routinely ships with 0777 perms inside .app/.bundle
+# containers that are technically reachable through firmlinks. Those
+# are package hygiene issues, not OS-level security concerns. The dirs
+# below are the ones where an actual 0002 bit would matter.
+cmd_world_writable() {
+  require_macos
+
+  local -a search_paths=(
+    /bin /sbin /usr/bin /usr/sbin /usr/libexec
+    /etc
+    /System/Library/Frameworks
+    /System/Library/PrivateFrameworks
+    /System/Library/Extensions
+    /System/Library/LaunchDaemons
+    /System/Library/LaunchAgents
+  )
+
+  local -a hits=()
+  while IFS= read -r line; do
+    hits+=("$line")
+  done < <(find "${search_paths[@]}" -type f -perm -0002 -ls 2>/dev/null | head -200)
+
+  if (( JSON )); then
+    printf '{"count":%d,"hits":[' "${#hits[@]}"
+    local first=1
+    if (( ${#hits[@]} > 0 )); then
+      for line in "${hits[@]}"; do
+        (( first )) || printf ','
+        first=0
+        printf '"%s"' "$(printf '%s' "$line" | sed 's/"/\\"/g')"
+      done
+    fi
+    printf ']}\n'
+    return
+  fi
+
+  header "World-writable files in critical system dirs"
+  echo "  Scope: ${search_paths[*]}"
+  echo
+
+  if (( ${#hits[@]} > 0 )); then
+    for line in "${hits[@]}"; do
+      echo "  $line"
+    done
+    printf '\n  %s⚠ %d world-writable file(s) — review.%s\n\n' "$C_YELLOW" "${#hits[@]}" "$C_RESET"
+  else
+    printf '  %s✓ none found — clean.%s\n\n' "$C_GREEN" "$C_RESET"
+  fi
+}
+
+# ─── subcommand: tree ───────────────────────────────────────────────────
+cmd_tree() {
+  require_macos
+  local depth="${1:-2}"
+
+  if ! [[ "$depth" =~ ^[0-9]+$ ]] || (( depth < 1 || depth > 6 )); then
+    die "tree depth must be an integer 1-6 (got: $depth)"
+  fi
+
+  header "Root tree (depth $depth)"
+
+  # Prefer real `tree` if installed at a known path. `tree` in PATH may
+  # be eza-aliased (eza ships a `tree` command that takes different
+  # flags). Check known locations first.
+  local tree_bin=""
+  for cand in /usr/local/bin/tree /opt/homebrew/bin/tree /opt/local/bin/tree; do
+    if [[ -x "$cand" ]]; then
+      tree_bin="$cand"
+      break
+    fi
+  done
+
+  if [[ -n "$tree_bin" ]]; then
+    "$tree_bin" -L "$depth" -F / 2>/dev/null | head -400 | sed 's/^/  /'
+  else
+    # Fallback: find + awk indent. Less pretty but no deps.
+    find / -maxdepth "$depth" 2>/dev/null \
+      | sort \
+      | awk -v depth="$depth" '
+        {
+          # depth from leading slashes (minus 1 for root)
+          n = gsub("/", "/", $0) - 1
+          if ($0 == "/") n = 0
+          indent = ""
+          for (i = 0; i < n; i++) indent = indent "  "
+          name = $0
+          if (name != "/") sub(/.*\//, "", name)
+          printf "  %s%s\n", indent, name
+        }' \
+      | head -400
+  fi
+  echo
+}
+
+# ─── subcommand: doctor ─────────────────────────────────────────────────
+cmd_doctor() {
+  require_macos
+  local status=0
+  local -a findings=()
+
+  # 1. SSV is sealed
+  if mount | awk '$3=="/"' | grep -q sealed; then
+    findings+=("OK|SSV is sealed (boot-time signature verified)")
+  else
+    findings+=("CRIT|SSV is NOT sealed — verify SIP and APFS state")
+    status=2
+  fi
+
+  # 2. SIP enabled
+  if csrutil status 2>&1 | grep -qi "enabled"; then
+    findings+=("OK|SIP is enabled")
+  else
+    findings+=("WARN|SIP is disabled or in custom configuration")
+    (( status < 1 )) && status=1
+  fi
+
+  # 3. No world-writable in critical system dirs (narrow scope — see
+  #    cmd_world_writable for why we don't scan all of /usr or /System).
+  local ww
+  ww=$(find /bin /sbin /usr/bin /usr/sbin /usr/libexec /etc \
+            /System/Library/Frameworks /System/Library/Extensions \
+            /System/Library/LaunchDaemons /System/Library/LaunchAgents \
+        -type f -perm -0002 2>/dev/null | wc -l | tr -d ' ')
+  if (( ww == 0 )); then
+    findings+=("OK|No world-writable files in critical system dirs")
+  else
+    findings+=("WARN|$ww world-writable file(s) in critical system dirs")
+    (( status < 1 )) && status=1
+  fi
+
+  # 4. Root-level symlinks resolve. Note: /.VolumeIcon.icns is allowed to
+  #    be broken by design — it's a fixed symlink to a target that only
+  #    exists when the volume has a custom Finder icon. On a default
+  #    install it's a "dangling" link, but that's normal, not a fault.
+  local broken=0
+  local broken_paths=""
+  while IFS= read -r link; do
+    [[ -e "$link" ]] && continue
+    [[ "$link" == "/.VolumeIcon.icns" ]] && continue
+    broken=$((broken+1))
+    broken_paths="${broken_paths:+$broken_paths, }$link"
+  done < <(find / -maxdepth 1 -type l 2>/dev/null)
+  if (( broken == 0 )); then
+    findings+=("OK|All root-level symlinks resolve")
+  else
+    findings+=("WARN|$broken broken symlink(s): $broken_paths")
+    (( status < 1 )) && status=1
+  fi
+
+  # 5. Firmlinks file present
+  if [[ -r /usr/share/firmlinks ]]; then
+    local nf
+    nf=$(grep -cv '^$' /usr/share/firmlinks)
+    findings+=("OK|/usr/share/firmlinks present ($nf entries)")
+  else
+    findings+=("WARN|/usr/share/firmlinks missing or unreadable")
+    (( status < 1 )) && status=1
+  fi
+
+  # 6. Has APFS snapshots (System volume should retain at least one)
+  local snap_count
+  snap_count=$(diskutil apfs listSnapshots / 2>/dev/null | grep -c "Snapshot UUID" || true)
+  if (( snap_count > 0 )); then
+    findings+=("OK|SSV has $snap_count snapshot(s)")
+  else
+    findings+=("INFO|No SSV snapshots visible (non-snapshot boot, or restricted access)")
+  fi
+
+  # 7. /private exists and is writable (Data volume reachable)
+  if [[ -d /private ]] && touch /private/tmp/.mac-anatomy-write-test 2>/dev/null; then
+    rm -f /private/tmp/.mac-anatomy-write-test
+    findings+=("OK|Data volume reachable + writable (touched /private/tmp)")
+  else
+    findings+=("WARN|/private/tmp not writable — Data volume issue?")
+    (( status < 1 )) && status=1
+  fi
+
+  if (( JSON )); then
+    printf '{"status":%d,"findings":[' "$status"
+    local first=1
+    for f in "${findings[@]}"; do
+      (( first )) || printf ','
+      first=0
+      local sev="${f%%|*}"
+      local msg="${f#*|}"
+      printf '{"severity":"%s","message":"%s"}' "$sev" "$(printf '%s' "$msg" | sed 's/"/\\"/g')"
+    done
+    printf ']}\n'
+    return $status
+  fi
+
+  header "mac-anatomy doctor"
+  for f in "${findings[@]}"; do
+    local sev="${f%%|*}"
+    local msg="${f#*|}"
+    case "$sev" in
+      OK)   printf '  %s✓%s %s\n' "$C_GREEN"  "$C_RESET" "$msg" ;;
+      INFO) printf '  %sℹ%s %s\n' "$C_BLUE"   "$C_RESET" "$msg" ;;
+      WARN) printf '  %s⚠%s %s\n' "$C_YELLOW" "$C_RESET" "$msg" ;;
+      CRIT) printf '  %s✗%s %s\n' "$C_RED"    "$C_RESET" "$msg" ;;
+    esac
+  done
+
+  echo
+  case $status in
+    0) printf '  %sStatus: healthy%s (exit 0)\n\n' "$C_GREEN"  "$C_RESET" ;;
+    1) printf '  %sStatus: warnings%s (exit 1)\n\n' "$C_YELLOW" "$C_RESET" ;;
+    2) printf '  %sStatus: critical%s (exit 2)\n\n' "$C_RED"    "$C_RESET" ;;
+  esac
+  return $status
+}
+
+# ─── subcommand: report (HTML) ──────────────────────────────────────────
+cmd_report() {
+  require_macos
+  local outfile="${1:-/tmp/mac-anatomy-$(date +%Y%m%d-%H%M%S).html}"
+  local outdir
+  outdir=$(dirname "$outfile")
+  [[ -d "$outdir" ]] || die "output dir does not exist: $outdir"
+
+  note "Capturing subcommand output for HTML report..."
+
+  # Force plain output during capture
+  local saved_quiet=$QUIET saved_color=$NO_COLOR
+  QUIET=1
+  NO_COLOR=1
+  setup_colors
+
+  local overview_out volumes_out firmlinks_out symlinks_out sip_out
+  local setuid_out ww_out doctor_out tree_out
+  overview_out=$(safe_capture cmd_overview)
+  volumes_out=$(safe_capture cmd_volumes)
+  firmlinks_out=$(safe_capture cmd_firmlinks)
+  symlinks_out=$(safe_capture cmd_symlinks)
+  sip_out=$(safe_capture cmd_sip)
+  setuid_out=$(safe_capture cmd_setuid)
+  ww_out=$(safe_capture cmd_world_writable)
+  tree_out=$(safe_capture cmd_tree 3)
+  doctor_out=$(cmd_doctor 2>&1 || true)
+
+  QUIET=$saved_quiet
+  NO_COLOR=$saved_color
+  setup_colors
+
+  local hostname_val date_val mac_ver
+  hostname_val=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
+  date_val=$(date '+%Y-%m-%d %H:%M:%S %Z')
+  mac_ver=$(sw_vers -productVersion)
+
+  {
+    cat <<HTML_HEAD
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mac-anatomy — ${hostname_val} — ${date_val}</title>
+  <style>
+    :root { color-scheme: light dark; --accent: #007aff; }
+    * { box-sizing: border-box; }
+    body { font: 15px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro", system-ui, sans-serif;
+           max-width: 1024px; margin: 2em auto; padding: 0 1.25em; }
+    h1 { border-bottom: 2px solid currentColor; padding-bottom: 0.3em; margin-bottom: 0.2em; }
+    h2 { margin-top: 2.2em; border-bottom: 1px solid #888; padding-bottom: 0.25em;
+         scroll-margin-top: 1em; }
+    .meta { color: #888; margin-top: 0; }
+    pre { background: rgba(127,127,127,0.10); padding: 1em; overflow-x: auto;
+          border-radius: 6px; border-left: 3px solid var(--accent);
+          font: 12.5px/1.45 "SF Mono", Menlo, Consolas, monospace; }
+    nav { background: rgba(127,127,127,0.06); padding: 0.8em 1em; border-radius: 6px;
+          margin: 1.5em 0; }
+    nav strong { display: block; margin-bottom: 0.4em; }
+    nav ul { list-style: none; padding-left: 0; margin: 0;
+             display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+             gap: 0.4em; }
+    nav a { text-decoration: none; color: var(--accent); }
+    nav a:hover { text-decoration: underline; }
+    footer { margin-top: 4em; color: #888; font-size: 0.9em;
+             border-top: 1px solid #ccc; padding-top: 1em; }
+    footer a { color: var(--accent); }
+    .legend { margin: 0.5em 0 1.5em; color: #888; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>mac-anatomy report</h1>
+  <p class="meta">Host: <strong>${hostname_val}</strong> · macOS ${mac_ver} · Generated ${date_val}</p>
+  <p class="legend">Section output is captured verbatim from each <code>mac-anatomy</code> subcommand,
+     with ANSI color stripped. Run the corresponding command live for the up-to-the-second view.</p>
+
+  <nav>
+    <strong>Jump to:</strong>
+    <ul>
+      <li><a href="#doctor">▸ Health check</a></li>
+      <li><a href="#overview">▸ Overview</a></li>
+      <li><a href="#volumes">▸ Volumes</a></li>
+      <li><a href="#firmlinks">▸ Firmlinks</a></li>
+      <li><a href="#symlinks">▸ Symlinks</a></li>
+      <li><a href="#sip">▸ SIP</a></li>
+      <li><a href="#setuid">▸ Setuid</a></li>
+      <li><a href="#ww">▸ World-writable</a></li>
+      <li><a href="#tree">▸ Tree</a></li>
+    </ul>
+  </nav>
+
+  <h2 id="doctor">Health check</h2>
+  <pre>$(printf '%s' "$doctor_out" | html_escape)</pre>
+
+  <h2 id="overview">Overview</h2>
+  <pre>$(printf '%s' "$overview_out" | html_escape)</pre>
+
+  <h2 id="volumes">Volumes</h2>
+  <pre>$(printf '%s' "$volumes_out" | html_escape)</pre>
+
+  <h2 id="firmlinks">Firmlinks</h2>
+  <pre>$(printf '%s' "$firmlinks_out" | html_escape)</pre>
+
+  <h2 id="symlinks">Symlinks</h2>
+  <pre>$(printf '%s' "$symlinks_out" | html_escape)</pre>
+
+  <h2 id="sip">SIP</h2>
+  <pre>$(printf '%s' "$sip_out" | html_escape)</pre>
+
+  <h2 id="setuid">Setuid binaries</h2>
+  <pre>$(printf '%s' "$setuid_out" | html_escape)</pre>
+
+  <h2 id="ww">World-writable</h2>
+  <pre>$(printf '%s' "$ww_out" | html_escape)</pre>
+
+  <h2 id="tree">Tree (depth 3)</h2>
+  <pre>$(printf '%s' "$tree_out" | html_escape)</pre>
+
+  <footer>
+    Generated by <a href="${REPO_URL}">mac-anatomy</a> v${VERSION}. MIT licensed.
+    Companion to <code>mac-doctor</code>, <code>finder-doctor</code>,
+    <code>disk-doctor</code>, <code>startup-doctor</code>, <code>monitor-info</code>.
+  </footer>
+</body>
+</html>
+HTML_HEAD
+  } > "$outfile"
+
+  note "Report written to: $outfile"
+  printf '%s\n' "$outfile"
+  if (( OPEN_REPORT )); then
+    open "$outfile" >/dev/null 2>&1 || note "(could not open in browser — file is at $outfile)"
+  fi
+}
+
+# ─── help ───────────────────────────────────────────────────────────────
+cmd_help() {
+  cat <<HELP
+mac-anatomy v${VERSION} — map and audit the macOS root filesystem
+
+USAGE
+  mac-anatomy [global-flags] <subcommand> [args]
+
+SUBCOMMANDS
+  overview               Quick summary: macOS, boot volume, SIP, layout (default)
+  volumes                APFS container + volume structure (diskutil)
+  firmlinks              List /usr/share/firmlinks with explanations
+  symlinks               Root-level symlinks with legacy-path annotations
+  sip                    System Integrity Protection status + what it covers
+  setuid                 Setuid/setgid binaries in /usr/bin /usr/sbin /bin /sbin /usr/libexec
+  world-writable | ww    Find world-writable files in system dirs (security)
+  tree [depth]           ASCII tree of root (default depth 2, max 6)
+  doctor                 Health check (sealed SSV, SIP, no world-writable, etc.)
+  report [path]          Generate single-file HTML report
+
+GLOBAL FLAGS
+  --json                 Machine-readable output (where supported)
+  --no-color             Disable ANSI color
+  --quiet,    -q         Suppress section headers
+  --verbose,  -v         Extra detail
+  --open                 (with 'report') open generated HTML in default browser
+  --version              Print version + exit
+  --help,     -h         Print this help + exit
+
+EXIT CODES (doctor only)
+  0  healthy
+  1  warnings present
+  2  critical issue (SSV not sealed)
+
+EXAMPLES
+  mac-anatomy                          # default overview
+  mac-anatomy volumes                  # APFS structure
+  mac-anatomy firmlinks                # what's actually on Data volume
+  mac-anatomy doctor                   # health check, exit 0/1/2
+  mac-anatomy doctor --json | jq .     # machine-readable doctor
+  mac-anatomy report --open            # HTML report, open in browser
+  mac-anatomy tree 3                   # 3-level deep tree of /
+
+REPOSITORY
+  ${REPO_URL}
+
+LICENSE
+  MIT
+HELP
+}
+
+# ─── main dispatch ──────────────────────────────────────────────────────
+main() {
+  local cmd=""
+  local -a args=()
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --json)        JSON=1 ;;
+      --no-color)    NO_COLOR=1 ;;
+      --quiet|-q)    QUIET=1 ;;
+      --verbose|-v)  VERBOSE=1 ;;
+      --open)        OPEN_REPORT=1 ;;
+      --version)     echo "mac-anatomy v${VERSION}"; exit 0 ;;
+      --help|-h)     cmd_help; exit 0 ;;
+      --)            shift; while (( $# > 0 )); do args+=("$1"); shift; done; break ;;
+      -*)            die "unknown flag: $1 (try --help)" ;;
+      *)
+        if [[ -z "$cmd" ]]; then
+          cmd="$1"
+        else
+          args+=("$1")
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  setup_colors
+
+  case "${cmd:-overview}" in
+    overview)         cmd_overview ;;
+    volumes)          cmd_volumes ;;
+    firmlinks)        cmd_firmlinks ;;
+    symlinks)         cmd_symlinks ;;
+    sip)              cmd_sip ;;
+    setuid)           cmd_setuid ;;
+    world-writable|ww) cmd_world_writable ;;
+    tree)             cmd_tree "${args[@]+"${args[@]}"}" ;;
+    doctor)           cmd_doctor ;;
+    report)           cmd_report "${args[@]+"${args[@]}"}" ;;
+    help)             cmd_help ;;
+    *) die "unknown subcommand: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
